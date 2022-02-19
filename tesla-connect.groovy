@@ -1,7 +1,7 @@
 /**
  *  Tesla Connect
  *
- *  Copyright 2018-2022 Trent Foley, Andy Reid
+ *  Copyright 2018 Trent Foley
  *
  *  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
  *  in compliance with the License. You may obtain a copy of the License at:
@@ -11,14 +11,28 @@
  *  Unless required by applicable law or agreed to in writing, software distributed under the License is distributed
  *  on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License
  *  for the specific language governing permissions and limitations under the License.
+ * 10/18/20 lgkahn added open/unlock charge port
+ * lgk added aption to put in new access token directly to get around login issues. Change4 to reset it to blank after use.
+ * fix the updatesetting to clearsetting fx. 1/18/21
  *
+ * lgk 3/2/21 new changes.. username password no longer used. Left in place if we ever get oauth2 working again.
+ * added additional field, to get token from a web server in form of:
+ *
+ * {"access_token":"qts-689e5thisisatoken8","token_type":"bearer","expires_in":3888000,"refresh_token":"thisisarefreshtokenc0","created_at":1614466853}
+ *
+ * i use tesla.py to generate token monthly and push to my own webserver.
+ * also added notification to tell you when token is refreshed via entered token or refresh url. Also notify of failures.
+ *
+ * 3/17/21 add set charge limit command and charge limit coming back from api in variable.
+ *
+ * lgk 10/19/21 change set temp setpoint to double precision to get around integer values being used in conversions.
  */
 
 definition(
     name: "Tesla Connect",
     namespace: "trentfoley",
     author: "Trent Foley, Larry Kahn, Andy Reid",
-    description: "Integrate your Tesla car with Hubitat.",
+    description: "Integrate your Tesla car with SmartThings.",
     category: "Convenience",
     iconUrl: "https://s3.amazonaws.com/smartapp-icons/Partner/tesla-app%402x.png",
     iconX2Url: "https://s3.amazonaws.com/smartapp-icons/Partner/tesla-app%403x.png",
@@ -34,8 +48,9 @@ preferences {
 def loginToTesla() {
     def showUninstall = email != null && password != null
     return dynamicPage(name: "VehicleAuth", title: "Connect your Tesla", nextPage:"selectVehicles", uninstall:showUninstall) {
-        section("Token refresh options:") {
+        section("Tokens:") {
             input "refreshToken", "text", title: "Refresh Token", required: true, autoCorrect:false
+            input "accessToken", "text", title: "Access Token", required: true, autoCorrect:false
         }
         section("To use Tesla, Hubitat encrypts and securely stores a token.") {}
     }
@@ -76,21 +91,23 @@ def refreshAccessToken() {
     log.debug "refreshAccessToken"
     try {
         if (state.refreshToken) {
-            log.debug "Found refresh token so attempting an oAuth refresh"
+            log.debug "Found refresh token so attempting an oAuth refresh " + state.refreshToken
             try {
                 httpPostJson([
-                    uri: serverUrl,
-                    path: "/oauth/token",
+                    uri: "https://auth.tesla.com",
+                    path: "/oauth2/v3/token",
                     headers: [ 'User-Agent': userAgent ],
                     body: [
                         grant_type: "refresh_token",
-                        client_id: clientId,
-                        client_secret: clientSecret,
-                        refresh_token: state.refreshToken
+                        client_id: "ownerapi",
+                        refresh_token: state.refreshToken,
+                        scope: "openid email offline_access"
                     ]
                 ]) { resp ->
                     state.accessToken = resp.data.access_token
                     state.refreshToken = resp.data.refresh_token
+                    log.debug "New access token " + state.accessToken
+                    log.debug "New refresh token " + state.refreshToken
                 }
             } catch (groovyx.net.http.HttpResponseException e) {
                 log.warn e
@@ -107,13 +124,7 @@ def refreshAccessToken() {
         
 }
 
-private authorizedHttpRequest(Map options = [:], String path, String method, Closure closure) {
-
-    if (state.accessToken == null){
-        refreshAccessToken()
-    }
-
-    def attempt = options.attempt ?: 0
+private authorizedHttpRequest(String path, String method, Closure closure, Integer attempt = 0) {
     
     log.debug "authorizedHttpRequest ${method} ${path} attempt ${attempt}"
     try {
@@ -122,28 +133,24 @@ private authorizedHttpRequest(Map options = [:], String path, String method, Clo
             path: path,
             headers: [
                 'User-Agent': userAgent,
-                Authorization: "Bearer ${accessToken}"
+                Authorization: "Bearer ${state.accessToken}"
             ]
         ]
     
         if (method == "GET") {
             httpGet(requestParameters) { resp -> closure(resp) }
         } else if (method == "POST") {
-            if (options.body) {
-                requestParameters["body"] = options.body
-                log.debug "authorizedHttpRequest body: ${options.body}"
-                httpPostJson(requestParameters) { resp -> closure(resp) }
-            } else {
-                httpPost(requestParameters) { resp -> closure(resp) }
-            }
+            httpPost(requestParameters) { resp -> closure(resp) }
         } else {
             log.error "Invalid method ${method}"
         }
     } catch (groovyx.net.http.HttpResponseException e) {
-        if (e.response?.data?.status?.code == 14) {
+        log.error "Request failed for path: ${path}.  ${e.response?.data}"                
+
+        if (e.response?.data?.error != null && e.response?.data?.error.equals("invalid bearer token")) {
             if (attempt < 3) {
                 refreshAccessToken()
-                authorizedHttpRequest(path, mehod, closure, body: options.body, attempt: attempt++)
+                authorizedHttpRequest(path, method, closure, attempt + 1)
             } else {
                 log.error "Failed after 3 attempts to perform request: ${path}"
             }
@@ -309,7 +316,7 @@ def wake(child) {
 
 private executeApiCommand(Map options = [:], child, String command) {
     def result = false
-    authorizedHttpRequest(options, "/api/1/vehicles/${child.device.deviceNetworkId}/command/${command}", "POST", { resp ->
+    authorizedHttpRequest("/api/1/vehicles/${child.device.deviceNetworkId}/command/${command}", "POST", { resp ->
         result = resp.data.result
     })
     return result
